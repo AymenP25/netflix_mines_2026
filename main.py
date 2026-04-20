@@ -3,8 +3,11 @@ from pydantic import BaseModel
 from typing import Optional
 import sqlite3
 import bcrypt
-import jwt
-import datetime
+import hmac
+import hashlib
+import base64
+import json
+import time
 
 from db import get_connection
 
@@ -49,21 +52,38 @@ class PreferenceBody(BaseModel):
     genre_id: int
 
 
+def _b64_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+def _b64_decode(s: str) -> bytes:
+    padding = 4 - len(s) % 4
+    return base64.urlsafe_b64decode(s + "=" * padding)
+
 def create_token(user_id: int) -> str:
-    payload = {
-        "user_id": user_id,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24)
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+    header = _b64_encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    payload = _b64_encode(json.dumps({"user_id": user_id, "exp": int(time.time()) + 86400}).encode())
+    signature = _b64_encode(
+        hmac.new(SECRET_KEY.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest()
+    )
+    return f"{header}.{payload}.{signature}"
 
 def decode_token(token: str) -> int:
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        return payload["user_id"]
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expiré")
-    except jwt.InvalidTokenError:
+        header, payload, signature = token.split(".")
+    except ValueError:
         raise HTTPException(status_code=401, detail="Token invalide")
+
+    expected = _b64_encode(
+        hmac.new(SECRET_KEY.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest()
+    )
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(status_code=401, detail="Token invalide")
+
+    data = json.loads(_b64_decode(payload))
+    if data.get("exp", 0) < int(time.time()):
+        raise HTTPException(status_code=401, detail="Token expiré")
+
+    return data["user_id"]
 
 def get_user_id_from_header(authorization: str) -> int:
     if not authorization or not authorization.startswith("Bearer "):
@@ -85,12 +105,8 @@ def get_films(page: int = 1, per_page: int = 20, genre_id: Optional[int] = None)
         cursor = conn.cursor()
 
         if genre_id:
-            cursor.execute(
-                "SELECT COUNT(*) FROM Film WHERE Genre_ID = ?",
-                (genre_id,)
-            )
+            cursor.execute("SELECT COUNT(*) FROM Film WHERE Genre_ID = ?", (genre_id,))
             total = cursor.fetchone()[0]
-
             cursor.execute(
                 "SELECT * FROM Film WHERE Genre_ID = ? ORDER BY DateSortie DESC LIMIT ? OFFSET ?",
                 (genre_id, per_page, offset)
@@ -98,7 +114,6 @@ def get_films(page: int = 1, per_page: int = 20, genre_id: Optional[int] = None)
         else:
             cursor.execute("SELECT COUNT(*) FROM Film")
             total = cursor.fetchone()[0]
-
             cursor.execute(
                 "SELECT * FROM Film ORDER BY DateSortie DESC LIMIT ? OFFSET ?",
                 (per_page, offset)
@@ -154,10 +169,7 @@ def register(body: RegisterBody):
 def login(body: LoginBody):
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM Utilisateur WHERE AdresseMail = ?",
-            (body.email,)
-        )
+        cursor.execute("SELECT * FROM Utilisateur WHERE AdresseMail = ?", (body.email,))
         user = cursor.fetchone()
 
     if user is None or not bcrypt.checkpw(body.password.encode(), user["MotDePasse"].encode()):

@@ -1,6 +1,7 @@
 fastapi
 uvicorn
+pydantic
 bcrypt
-PyJWT
-pytest
-httpx
+typing
+
+datetime
